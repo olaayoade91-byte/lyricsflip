@@ -18,39 +18,13 @@ use crate::{
     MAX_PAGE_LIMIT, MAX_ROUND_PLAYERS,
 };
 use soroban_sdk::{
+    xdr,
     testutils::{Address as _, ContractEvents, Events, Ledger},
     Address, Env, Event, Map, String, Vec,
 };
 
 /// 2026-05-28, so cards up to year 2026 pass validation.
 const NOW: u64 = 1_780_000_000;
-use crate::{
-    Answer, Card, Error, Genre, LyricsFlip, LyricsFlipClient, Milestone, Role, RoleUpdated,
-    RoundCancelled, RoundCompleted, RoundLeft, CARD_ANSWER_WINDOW_SECONDS, DEFAULT_MAX_PLAYERS,
-    LOBBY_TIMEOUT_SECONDS, MAX_PAGE_LIMIT,
-};
-use soroban_sdk::{
-    events::Event as _,
-    testutils::{Address as _, ContractEvents, Events, Ledger},
-    Address, Env, Map, String,
-};
-//! Unit tests for the `lyricsflip` contract.
-//!
-//! Coverage targets:
-//! - Every public function (happy path + key error paths).
-//! - Every `Error` variant.
-//! - `build_question_card` with all three `QuestionKind` values (LF-029)
-//!   plus the LF-010 small-card-set edge cases.
-//!
-//! Run with `cargo test` inside `onchain/`.
-
-use crate::{
-    Answer, Card, Error, Genre, LyricsFlip, LyricsFlipClient, QuestionKind, Role, MAX_PAGE_LIMIT,
-};
-use soroban_sdk::{
-    testutils::{Address as _, Ledger as _},
-    xdr, Address, Env, String,
-};
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -245,6 +219,136 @@ fn round_count_tracks_creates() {
         client.create_round(&owner, &Some(Genre::Pop), &seed);
     }
     assert_eq!(client.get_round_count(), 3);
+}
+
+#[test]
+fn create_round_picks_cards_from_selected_genre() {
+    let (env, client, owner) = setup();
+    // Add cards across two genres
+    for i in 0..3u64 {
+        client.add_card(
+            &owner,
+            &Card {
+                card_id: 0,
+                genre: Genre::Pop,
+                artist: alloc_string(&env, &format_u64("PopArtist ", i)),
+                title: alloc_string(&env, &format_u64("PopTitle ", i)),
+                year: 2000 + i,
+                lyrics: String::from_str(&env, "lyric"),
+            },
+        );
+    }
+    for i in 0..3u64 {
+        client.add_card(
+            &owner,
+            &Card {
+                card_id: 0,
+                genre: Genre::Rock,
+                artist: alloc_string(&env, &format_u64("RockArtist ", i)),
+                title: alloc_string(&env, &format_u64("RockTitle ", i)),
+                year: 1990 + i,
+                lyrics: String::from_str(&env, "lyric"),
+            },
+        );
+    }
+    client.set_cards_per_round(&owner, &2);
+
+    // Create a Pop round
+    let round_id = client.create_round(&owner, &Some(Genre::Pop), &1u64);
+    let round_cards = client.get_round_cards(&round_id);
+    assert_eq!(round_cards.len(), 2);
+
+    // Verify all cards belong to Pop genre
+    for card_id in round_cards.iter() {
+        let card = client.get_card(&card_id);
+        assert_eq!(card.genre, Genre::Pop, "All cards in Pop round must be Pop genre");
+    }
+}
+
+#[test]
+fn create_round_fails_with_empty_genre() {
+    let (env, client, owner) = setup();
+    // Add only Rock cards
+    for i in 0..3u64 {
+        client.add_card(
+            &owner,
+            &Card {
+                card_id: 0,
+                genre: Genre::Rock,
+                artist: alloc_string(&env, &format_u64("RockArtist ", i)),
+                title: alloc_string(&env, &format_u64("RockTitle ", i)),
+                year: 1990 + i,
+                lyrics: String::from_str(&env, "lyric"),
+            },
+        );
+    }
+    client.set_cards_per_round(&owner, &2);
+
+    // Try to create a Pop round (no Pop cards exist)
+    let result = client.try_create_round(&owner, &Some(Genre::Pop), &1u64);
+    let inner = result.unwrap_err();
+    let code: u32 = match inner {
+        Ok(e) => {
+            assert!(
+                e.is_type(xdr::ScErrorType::Contract),
+                "expected a contract error, got {:?}",
+                e
+            );
+            e.get_code()
+        }
+        Err(soroban_sdk::InvokeError::Contract(c)) => c,
+        Err(other) => panic!("expected EmptyGenreCards, got {:?}", other),
+    };
+    assert_eq!(code, Error::EmptyGenreCards as u32);
+}
+
+#[test]
+fn create_round_fails_when_genre_has_fewer_cards_than_cards_per_round() {
+    let (env, client, owner) = setup();
+    // Add only 1 Pop card
+    client.add_card(
+        &owner,
+        &Card {
+            card_id: 0,
+            genre: Genre::Pop,
+            artist: String::from_str(&env, "OnlyArtist"),
+            title: String::from_str(&env, "OnlyTitle"),
+            year: 2000,
+            lyrics: String::from_str(&env, "lyric"),
+        },
+    );
+    // Add more Rock cards
+    for i in 0..5u64 {
+        client.add_card(
+            &owner,
+            &Card {
+                card_id: 0,
+                genre: Genre::Rock,
+                artist: alloc_string(&env, &format_u64("RockArtist ", i)),
+                title: alloc_string(&env, &format_u64("RockTitle ", i)),
+                year: 1990 + i,
+                lyrics: String::from_str(&env, "lyric"),
+            },
+        );
+    }
+    client.set_cards_per_round(&owner, &3); // Need 3 cards per round
+
+    // Try to create a Pop round (only 1 Pop card exists)
+    let result = client.try_create_round(&owner, &Some(Genre::Pop), &1u64);
+    let inner = result.unwrap_err();
+    let code: u32 = match inner {
+        Ok(e) => {
+            assert!(
+                e.is_type(xdr::ScErrorType::Contract),
+                "expected a contract error, got {:?}",
+                e
+            );
+            e.get_code()
+        }
+        Err(soroban_sdk::InvokeError::Contract(c)) => c,
+        Err(other) => panic!("expected AmountExceedsLimit, got {:?}", other),
+    };
+    assert_eq!(code, Error::AmountExceedsLimit as u32);
 }
 
 // ---------------------------------------------------------------------------
@@ -745,6 +849,37 @@ fn submit_answer_rejects_on_unstarted_round() {
     assert!(result.is_err());
 }
 
+#[test]
+fn submit_answer_rejects_before_first_card_with_no_active_card() {
+    let (env, client, owner) = setup();
+    seed_cards(&env, &client, &owner, 3);
+    client.set_cards_per_round(&owner, &1);
+    let round_id = client.create_round(&owner, &Some(Genre::Pop), &10u64);
+    client.start_round(&owner, &round_id);
+
+    // Round is started but no card has been drawn yet (next_card_index == 0)
+    let result = client.try_submit_answer(
+        &owner,
+        &round_id,
+        &Answer::Title(String::from_str(&env, "x")),
+    );
+
+    let inner = result.unwrap_err();
+    let code: u32 = match inner {
+        Ok(e) => {
+            assert!(
+                e.is_type(xdr::ScErrorType::Contract),
+                "expected a contract error, got {:?}",
+                e
+            );
+            e.get_code()
+        }
+        Err(soroban_sdk::InvokeError::Contract(c)) => c,
+        Err(other) => panic!("expected NoActiveCard, got {:?}", other),
+    };
+    assert_eq!(code, Error::NoActiveCard as u32);
+}
+
 // ---------------------------------------------------------------------------
 // get_cards_of_genre / artist / year
 // ---------------------------------------------------------------------------
@@ -791,7 +926,6 @@ fn get_cards_of_artist_returns_requested_amount() {
                 card_id: 0,
                 genre: Genre::Rock,
                 artist: String::from_str(&env, "The Same Artist"),
-                title: String::from_str(&env, &std::format!("Song {}", i)),
                 title: alloc_string(&env, &format_u64("Song ", i)),
                 year: 2000 + i,
                 lyrics: String::from_str(&env, "lyric"),
@@ -818,8 +952,6 @@ fn get_cards_of_year_returns_requested_amount() {
             &Card {
                 card_id: 0,
                 genre: Genre::Jazz,
-                artist: String::from_str(&env, &std::format!("Artist {}", i)),
-                title: String::from_str(&env, &std::format!("Track {}", i)),
                 artist: alloc_string(&env, &format_u64("Artist ", i)),
                 title: alloc_string(&env, &format_u64("Track ", i)),
                 year: 1990,
@@ -1208,7 +1340,7 @@ fn error_codes_are_stable() {
         (Error::RoundNotReady, 18),
         (Error::RoundAlreadyFinalized, 19),
         (Error::NotEnoughDistinctCards, 20),
-        (Error::RoundCancelled, 20),
+        (Error::RoundCancelled, 35),
         (Error::RoundFull, 21),
         (Error::InvalidMaxPlayers, 22),
         (Error::NftContractNotSet, 23),
@@ -1222,6 +1354,7 @@ fn error_codes_are_stable() {
         (Error::DuplicateCard, 31),
         (Error::BatchTooLarge, 32),
         (Error::NotPendingOwner, 33),
+        (Error::NoActiveCard, 34),
     ];
     for (variant, code) in expected {
         assert_eq!(variant as u32, code, "{:?} was renumbered", variant);
